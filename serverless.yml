@@ -1,0 +1,295 @@
+service: poc-authorizer-iam
+
+custom:
+  webpack:
+    webpackConfig: ./webpack.config.js
+    packager: yarn
+    includeModules: true
+    exclude:
+      - node_modules/**
+
+#individual package lambdas functions
+package:
+  individually: true
+  # Add the serverless-webpack plugin
+plugins:
+  - serverless-webpack
+  - serverless-iamroles
+  - serverless-offline
+  - serverless-pseudo-parameters
+
+provider:
+  name: aws
+  runtime: nodejs12.x
+  region: us-east-1
+  accountId: { "Fn::Join": ["", [{ "Ref": "AWS::AccountId" }]] }
+  profile: default
+  stage: ${opt:stage,'dev'}
+  endpointType: regional
+  iamRoleStatements:
+    - Effect: "Allow"
+      Action:
+        - xray:PutTelemetryRecords
+        - xray:PutTraceSegments
+      Resource: "*"
+  environment:
+    REGION_ID: ${self:provider.region}
+    USER_POOL_ID: !Ref CognitoUserPool #us-east-1_JSikVYFRy #
+    APP_CLIENT_ID: !Ref CognitoUserPoolClient #65h578lultdh2emaq5j7efnlb0 #
+    IDENTITY_POOL_ID: !Ref CognitoIdentityPool #us-east-1:8c2ea0f1-ff08-48ac-aa83-7f1e80dd6b3e #
+    GROUP_USERS_NAME: !Ref UserPoolGroupUsers #poc-authorizer-iam-dev-group-name-users #
+    CognitoRegion: ${self:provider.region}
+  tracing:
+    lambda: true
+    apiGateway: true
+
+functions:
+  register:
+    handler: src/lambdas/identity/handler.register
+    iamRoleStatementsInherit: true
+    iamRoleStatements:
+      - Effect: "Allow"
+        Action:
+          - "cognito-idp:AdminAddUserToGroup"
+        Resource: "arn:aws:cognito-idp:#{AWS::Region}:#{AWS::AccountId}:userpool/#{CognitoUserPool}"
+    events:
+      - http:
+          path: auth/register
+          method: post
+          cors: true
+
+  authenticate:
+    handler: src/lambdas/identity/handler.authenticate
+    events:
+      - http:
+          path: auth/authenticate
+          method: post
+          cors: true
+  confirmRegister:
+    handler: src/lambdas/identity/handler.confirmRegister
+    events:
+      - http:
+          path: auth/confirm-register
+          method: post
+          cors: true
+  authorize:
+    handler: src/lambdas/identity/handler.authorize
+    events:
+      - http:
+          path: auth/authorize
+          method: post
+          cors: true
+  refreshToken:
+    handler: src/lambdas/identity/handler.refreshToken
+    events:
+      - http:
+          path: auth/refresh-token
+          method: post
+          cors: true
+
+  invokeProcessFiles:
+    handler: src/lambdas/processBatch/handler.invokeProcess
+    events:
+      - http:
+          path: process-file/
+          method: get
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref CognitoAuthorizer
+    environment:
+      PROCESS_FILE_URL: https://#{ApiGatewayRestApi}.execute-api.#{AWS::Region}.amazonaws.com/${self:provider.stage}/process-file/policy
+      # PROCESS_FILE_URL: https://2gtt2jiubj.execute-api.us-east-1.amazonaws.com/dev/process-file/policy
+  processFiles:
+    handler: src/lambdas/processBatch/handler.processFilesPolicy
+    events:
+      - http:
+          path: process-file/policy
+          method: post
+          cors: true
+          authorizer: aws_iam
+resources:
+  Resources:
+    #Cognito - User Pool
+    CognitoUserPool:
+      Type: AWS::Cognito::UserPool
+      Properties:
+        UserPoolName: poc-authorizer-iam-${self:provider.stage}-user-pool
+        Policies:
+          PasswordPolicy:
+            MinimumLength: 8
+        UsernameAttributes:
+          - email
+        AutoVerifiedAttributes:
+          - email
+        # AliasAttributes:
+        #   - email
+        UsernameConfiguration:
+          CaseSensitive: false
+        Schema:
+          - Name: email
+            AttributeDataType: String
+            Required: true
+          - Name: document_number
+            Required: false
+            Mutable: true
+            AttributeDataType: String
+            StringAttributeConstraints:
+              MinLength: 8
+              MaxLength: 15
+    #Cognito - Client
+    CognitoUserPoolClient:
+      Type: AWS::Cognito::UserPoolClient
+      Properties:
+        ClientName: poc-authorizer-iam-${self:provider.stage}-client
+        UserPoolId:
+          Ref: CognitoUserPool
+        ExplicitAuthFlows:
+          - ADMIN_NO_SRP_AUTH
+        GenerateSecret: false
+        RefreshTokenValidity: 1
+    #Cognito - Domain
+    UserPoolDomain:
+      Type: AWS::Cognito::UserPoolDomain
+      Properties:
+        UserPoolId:
+          Ref: CognitoUserPool
+        Domain: poc-authorizer-iam-${self:provider.stage}-domain
+
+    #Cognito - Identity Pool
+
+    CognitoIdentityPool:
+      Type: AWS::Cognito::IdentityPool
+      Properties:
+        IdentityPoolName: poc-authorizer-iam-${self:provider.stage}-identity-pool
+        AllowUnauthenticatedIdentities: false
+        CognitoIdentityProviders:
+          - ClientId: !Ref CognitoUserPoolClient
+            ProviderName: !GetAtt CognitoUserPool.ProviderName
+
+    CognitoAuthRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: poc-authorizer-iam-${self:provider.stage}-auth-role
+        Path: /
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Principal:
+                Federated: "cognito-identity.amazonaws.com"
+              Action:
+                - "sts:AssumeRoleWithWebIdentity"
+              Condition:
+                StringEquals:
+                  "cognito-identity.amazonaws.com:aud": !Ref CognitoIdentityPool
+                "ForAnyValue:StringLike":
+                  "cognito-identity.amazonaws.com:amr": authenticated
+        Policies:
+          - PolicyName: "CognitoAuthorizedPolicy"
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: "Allow"
+                  Action:
+                    - "mobileanalytics:PutEvents"
+                    - "cognito-sync:*"
+                    - "cognito-identity:*"
+                    - "cognito-idp:*"
+                  Resource: "*"
+                - Effect: "Allow"
+                  Action:
+                    - "execute-api:Invoke"
+                  Resource: "*"
+
+    CognitoUnauthRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: poc-authorizer-iam-${self:provider.stage}-unauth-role
+        Path: /
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Principal:
+                Federated: "cognito-identity.amazonaws.com"
+              Action:
+                - "sts:AssumeRoleWithWebIdentity"
+              Condition:
+                StringEquals:
+                  "cognito-identity.amazonaws.com:aud": !Ref CognitoIdentityPool
+                "ForAnyValue:StringLike":
+                  "cognito-identity.amazonaws.com:amr": unauthenticated
+        Policies:
+          - PolicyName: "CognitoUnauthorizedPolicy"
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: "Allow"
+                  Action:
+                    - "mobileanalytics:PutEvents"
+                    - "cognito-sync:*"
+                    - "cognito-identity:*"
+                    - "cognito-idp:*"
+                  Resource: "*"
+
+    CognitoIdentityPoolRoles:
+      Type: AWS::Cognito::IdentityPoolRoleAttachment
+      Properties:
+        IdentityPoolId: !Ref CognitoIdentityPool
+        Roles:
+          authenticated: !GetAtt CognitoAuthRole.Arn
+          unauthenticated: !GetAtt CognitoUnauthRole.Arn
+
+    CognitoAuthorizer:
+      Type: AWS::ApiGateway::Authorizer
+      Properties:
+        AuthorizerResultTtlInSeconds: 300
+        IdentitySource: method.request.header.Authorization
+        Name: poc-authorizer-iam-${self:provider.stage}-cognito-authorizer
+        RestApiId: !Ref ApiGatewayRestApi
+        Type: COGNITO_USER_POOLS
+        ProviderARNs:
+          - !GetAtt CognitoUserPool.Arn
+
+    UserPoolGroupUsers:
+      Type: "AWS::Cognito::UserPoolGroup"
+      Properties:
+        GroupName: poc-authorizer-iam-${self:provider.stage}-group-name-users
+        Description: "Group default for users"
+        Precedence: 1
+        RoleArn: !GetAtt CognitoAuthRole.Arn
+        UserPoolId: !Ref CognitoUserPool
+    # AddUserInUserGroupRole:
+    #   Type: AWS::IAM::Role
+    #   Properties:
+    #     RoleName: poc-authorizer-iam-${self:provider.stage}-role-add-user-to-group
+    #     AssumeRolePolicyDocument:
+    #       Version: "2012-10-17"
+    #       Statement:
+    #         - Effect: "Allow"
+    #           Principal:
+    #             Service:
+    #               - "cognito-idp.amazonaws.com"
+    #           Action:
+    #             - "sts:AssumeRoleWithWebIdentity"
+    #     Policies:
+    #       - PolicyName: poc-authorizer-iam-${self:provider.stage}-policy-add-user-to-group
+    #         PolicyDocument:
+    #           Version: "2012-10-17"
+    #           Statement:
+    #             - Effect: "Allow"
+    #               Action:
+    #                 - "cognito-idp:AdminAddUserToGroup"
+    #               Resource: "*"
+    # AddUserInUserGroupPolicy:
+    #   Type: "AWS::IAM::ManagedPolicy"
+    #   Properties:
+    #     ManagedPolicyName: poc-authorizer-iam-${self:provider.stage}-policy-add-user-to-group
+    #     PolicyDocument:
+    #       Version: 2012-10-17
+    #       Statement:
+    #         - Effect: Allow
+    #           Action:
+    #             - "cognito-idp:AdminAddUserToGroup"
+    #           Resource: "*"
